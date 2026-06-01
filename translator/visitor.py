@@ -12,6 +12,10 @@ class PythonToGoVisitor(Python3ParserVisitor):
         self.indent_level = 0
         self.output = []
         self.declared_vars = set()  # variables ya declaradas → usar = en vez de :=
+        self.current_class = None   # nombre de la clase en visita actual
+        self.class_fields  = []     # campos detectados en __init__ de la clase
+        self.in_generator  = False  # True cuando se visita cuerpo de generador
+        self.gen_ch_name   = "_ch"  # nombre del canal usado en generadores
 
     # ─────────────────────────────────────────────
     # Utilidades internas
@@ -65,9 +69,10 @@ class PythonToGoVisitor(Python3ParserVisitor):
         for child in ctx.children:
             if isinstance(child, Python3Parser.StmtContext):
                 compound = child.compound_stmt() if hasattr(child, 'compound_stmt') else None
-                is_funcdef = (compound is not None and
-                              compound.funcdef() is not None)
-                if is_funcdef:
+                is_funcdef   = (compound is not None and compound.funcdef()    is not None)
+                is_classdef  = (compound is not None and compound.classdef()  is not None)
+                is_asyncstmt = (compound is not None and compound.async_stmt() is not None)
+                if is_funcdef or is_classdef or is_asyncstmt:
                     top_funcs.append(self.visit(child))
                 else:
                     stmts.append(self.visit(child))
@@ -91,6 +96,27 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
     def visitSimple_stmt(self, ctx: Python3Parser.Simple_stmtContext):
         return self.visit(ctx.getChild(0))
+
+    # ─────────────────────────────────────────────
+    # Imports
+    # ─────────────────────────────────────────────
+
+    def visitImport_stmt(self, ctx: Python3Parser.Import_stmtContext):
+        return self.visit(ctx.getChild(0))
+
+    def visitImport_name(self, ctx: Python3Parser.Import_nameContext):
+        modules = ctx.dotted_as_names().getText().replace(",", ", ")
+        return f"{self.indent()}// Python import: {modules}"
+
+    def visitImport_from(self, ctx: Python3Parser.Import_fromContext):
+        children = [c.getText() for c in ctx.children]
+        try:
+            imp_idx = children.index('import')
+        except ValueError:
+            imp_idx = 2
+        module = "".join(children[1:imp_idx])
+        names = "".join(children[imp_idx + 1:]).strip("()")
+        return f"{self.indent()}// Python from {module} import {names}"
 
     # ─────────────────────────────────────────────
     # Compound statements (if/elif/else)
@@ -140,6 +166,133 @@ class PythonToGoVisitor(Python3ParserVisitor):
         result_lines.append(f"{self.indent()}}}")
         return "\n".join(result_lines)
 
+
+    def visitMatch_stmt(self, ctx: Python3Parser.Match_stmtContext):
+        subject = self.visit(ctx.subject_expr())
+        lines = [f"{self.indent()}switch {subject} {{"]
+        self.indent_level += 1
+        for case_block in ctx.case_block():
+            lines.append(self._visit_case_block(case_block, subject))
+        self.indent_level -= 1
+        lines.append(f"{self.indent()}}}")
+        return "\n".join(lines)
+
+    def visitSubject_expr(self, ctx: Python3Parser.Subject_exprContext):
+        return self.visit(ctx.getChild(0))
+
+    def _visit_case_block(self, ctx: Python3Parser.Case_blockContext, subject: str) -> str:
+        patterns_ctx = ctx.patterns()
+        guard_ctx    = ctx.guard()
+        body         = self._visit_block(ctx.block())
+
+        pattern_text = self._translate_pattern(patterns_ctx, subject)
+        guard_text   = f" && {self.visit(guard_ctx.test())}" if guard_ctx else ""
+
+        if pattern_text == "default":
+            header = f"{self.indent()}default:"
+        else:
+            header = f"{self.indent()}case {pattern_text}{guard_text}:"
+
+        return f"{header}\n{body}"
+
+    def _translate_pattern(self, ctx: Python3Parser.PatternsContext, subject: str) -> str:
+        text = ctx.getText()
+        if text == "_":
+            return "default"
+
+        if ctx.pattern() and ctx.pattern().or_pattern():
+            or_pat = ctx.pattern().or_pattern()
+            parts = [self._translate_closed_pattern(cp, subject)
+                     for cp in or_pat.closed_pattern()]
+            if len(parts) > 1:
+                return ", ".join(parts)
+            return parts[0] if parts else text
+
+        if ctx.open_sequence_pattern():
+            return "default"
+
+        return text
+
+    def _translate_closed_pattern(self, ctx: Python3Parser.Closed_patternContext, subject: str) -> str:
+        if ctx.wildcard_pattern():
+            return "default"
+        if ctx.literal_pattern():
+            return ctx.literal_pattern().getText()
+        if ctx.capture_pattern():
+            return "default"
+        return f"/* {ctx.getText()} */"
+
+    def visitTry_stmt(self, ctx: Python3Parser.Try_stmtContext):
+        ind = self.indent()
+        i1  = ind + "\t"
+        i2  = ind + "\t\t"
+        children = list(ctx.children)
+
+        blocks = ctx.block()
+        except_clauses = ctx.except_clause()
+
+        tokens = [c.getText() for c in children]
+        has_finally = 'finally' in tokens
+        has_else    = 'else' in tokens and bool(except_clauses)
+
+        try_block = blocks[0]
+        block_idx = 1
+
+        except_pairs = []
+        for clause in except_clauses:
+            except_pairs.append((clause, blocks[block_idx]))
+            block_idx += 1
+
+        else_block = blocks[block_idx] if has_else else None
+        if has_else:
+            block_idx += 1
+        finally_block = blocks[block_idx] if has_finally else None
+
+        lines = [f"{ind}func() {{"]
+
+        if finally_block:
+            self.indent_level += 1
+            fb = self._visit_block(finally_block)
+            self.indent_level -= 1
+            lines.append(f"{i1}defer func() {{")
+            lines.append(fb)
+            lines.append(f"{i1}}}()")
+
+        if except_pairs:
+            lines.append(f"{i1}defer func() {{")
+            lines.append(f"{i2}if _r := recover(); _r != nil {{")
+            for clause, exc_block in except_pairs:
+                alias = self._except_alias(clause)
+                if alias:
+                    lines.append(f"{i2}\t{alias} := _r")
+                self.indent_level += 3
+                eb = self._visit_block(exc_block)
+                self.indent_level -= 3
+                lines.append(eb)
+            lines.append(f"{i2}}}")
+            lines.append(f"{i1}}}()")
+
+        self.indent_level += 1
+        tb = self._visit_block(try_block)
+        self.indent_level -= 1
+        lines.append(tb)
+
+        if else_block:
+            self.indent_level += 1
+            eb = self._visit_block(else_block)
+            self.indent_level -= 1
+            lines.append(f"{i1}// else (no exception — approximation):")
+            lines.append(eb)
+
+        lines.append(f"{ind}}}()")
+        return "\n".join(lines)
+
+    def _except_alias(self, clause) -> str:
+        children = list(clause.children)
+        for i, c in enumerate(children):
+            if c.getText() == 'as' and i + 1 < len(children):
+                return children[i + 1].getText()
+        return ""
 
     def _visit_block(self, ctx) -> str:
         """Visita un bloque indentado y devuelve su contenido con un nivel más de indentación."""
@@ -227,6 +380,10 @@ class PythonToGoVisitor(Python3ParserVisitor):
         # 'def' name parameters ('->' test)? ':' block
         name = ctx.name().getText()
         params_go, defaults = self._translate_params(ctx.parameters())
+
+        if self._is_generator(ctx.block()):
+            return self._translate_generator_func(name, params_go, defaults, ctx.block())
+
         body = self._visit_block(ctx.block())
 
         # Detectar si hay return múltiple para inferir tipo de retorno
@@ -243,6 +400,177 @@ class PythonToGoVisitor(Python3ParserVisitor):
         lines.append(body)
         lines.append("}")
         return "\n".join(lines)
+
+    # ─────────────────────────────────────────────
+    # Generadores y async/await
+    # ─────────────────────────────────────────────
+
+    def _is_generator(self, block_ctx) -> bool:
+        if isinstance(block_ctx, Python3Parser.Yield_stmtContext):
+            return True
+        for i in range(block_ctx.getChildCount()):
+            if self._is_generator(block_ctx.getChild(i)):
+                return True
+        return False
+
+    def _translate_generator_func(self, name: str, params_go: str, defaults: dict, block_ctx) -> str:
+        ch = self.gen_ch_name
+        saved_indent = self.indent_level
+        self.in_generator = True
+        self.indent_level = 2
+        body = self._visit_block(block_ctx)
+        self.in_generator = False
+        self.indent_level = saved_indent
+
+        lines = [f"func {name}({params_go}) chan interface{{}} {{"]
+        lines.append(f"\t{ch} := make(chan interface{{}})")
+        lines.append(f"\tgo func() {{")
+        lines.append(f"\t\tdefer close({ch})")
+        for line in body.splitlines():
+            lines.append(f"\t{line}")
+        lines.append(f"\t}}()")
+        lines.append(f"\treturn {ch}")
+        lines.append("}")
+        return "\n".join(lines)
+
+    def visitYield_stmt(self, ctx: Python3Parser.Yield_stmtContext):
+        return self.visit(ctx.yield_expr())
+
+    def visitYield_expr(self, ctx: Python3Parser.Yield_exprContext):
+        ch = self.gen_ch_name
+        if not ctx.yield_arg():
+            return f"{self.indent()}{ch} <- nil"
+        arg = ctx.yield_arg()
+        if arg.getChild(0).getText() == 'from':
+            iterable = self.visit(arg.test())
+            return (f"{self.indent()}for _yv := range {iterable} {{\n"
+                    f"{self.indent()}\t{ch} <- _yv\n"
+                    f"{self.indent()}}}")
+        val = self.visit(arg.testlist())
+        return f"{self.indent()}{ch} <- {val}"
+
+    def visitAsync_stmt(self, ctx: Python3Parser.Async_stmtContext):
+        child = ctx.getChild(1)
+        if isinstance(child, Python3Parser.FuncdefContext):
+            name = child.name().getText()
+            params_go, defaults = self._translate_params(child.parameters())
+            return self._translate_generator_func(name, params_go, defaults, child.block())
+        return self.visit(child)
+
+    # ─────────────────────────────────────────────
+    # Clases
+    # ─────────────────────────────────────────────
+
+    def visitClassdef(self, ctx: Python3Parser.ClassdefContext):
+        import re
+        class_name = ctx.name().getText()
+        self.current_class = class_name
+        self.class_fields = []
+
+        bases = []
+        if ctx.arglist():
+            for arg in ctx.arglist().argument():
+                bases.append(self.visit(arg))
+
+        methods = []
+        class_vars = []
+        for child in ctx.block().children:
+            if not isinstance(child, Python3Parser.StmtContext):
+                continue
+            compound = child.compound_stmt() if hasattr(child, 'compound_stmt') else None
+            if compound and compound.funcdef():
+                fdef = compound.funcdef()
+                method_name = fdef.name().getText()
+                if method_name == "__init__":
+                    self._scan_init_fields(fdef.block())
+                    methods.append(('__init__', fdef))
+                else:
+                    methods.append((method_name, fdef))
+            else:
+                class_vars.append(child)
+
+        lines = []
+        lines.append(f"type {class_name} struct {{")
+        for base in bases:
+            lines.append(f"\t{base}")
+        for field in self.class_fields:
+            go_field = field[0].upper() + field[1:]
+            lines.append(f"\t{go_field} interface{{}}")
+        lines.append("}")
+        lines.append("")
+
+        for method_name, fdef in methods:
+            lines.append(self._translate_method(class_name, method_name, fdef))
+            lines.append("")
+
+        self.current_class = None
+        self.class_fields = []
+        return "\n".join(lines)
+
+    def _scan_init_fields(self, block_ctx):
+        import re
+        for i in range(block_ctx.getChildCount()):
+            child = block_ctx.getChild(i)
+            text = child.getText()
+            if "self." in text and "=" in text:
+                for match in re.finditer(r'self\.([A-Za-z_]\w*)\s*=', text):
+                    field = match.group(1)
+                    if field not in self.class_fields:
+                        self.class_fields.append(field)
+
+    def _translate_method(self, class_name: str, method_name: str, fdef) -> str:
+        params_go, defaults = self._translate_params(fdef.parameters())
+        params_list = [p.strip() for p in params_go.split(",") if p.strip()]
+        params_list = [p for p in params_list if not p.startswith("self ")]
+        params_go_clean = ", ".join(params_list)
+
+        saved_indent = self.indent_level
+        self.indent_level = 0
+
+        if method_name == "__init__":
+            body = self._visit_block_method(fdef.block(), class_name, receiver="_self")
+            self.indent_level = saved_indent
+            lines = []
+            lines.append(f"func New{class_name}({params_go_clean}) *{class_name} {{")
+            lines.append(f"\t_self := &{class_name}{{}}")
+            lines.append(body)
+            lines.append(f"\treturn _self")
+            lines.append("}")
+            return "\n".join(lines)
+
+        body = self._visit_block_method(fdef.block(), class_name, receiver="self")
+        self.indent_level = saved_indent
+
+        if method_name == "__str__":
+            go_name = "String"
+            rt = " string"
+        else:
+            go_name = method_name
+            ret = self._infer_return_type(fdef.block())
+            rt = f" {ret}" if ret else ""
+
+        lines = []
+        lines.append(f"func (self *{class_name}) {go_name}({params_go_clean}){rt} {{")
+        lines.append(body)
+        lines.append("}")
+        return "\n".join(lines)
+
+    def _visit_block_method(self, ctx, class_name: str, receiver: str = "self") -> str:
+        import re
+        self.indent_level += 1
+        lines = []
+        for child in ctx.children:
+            if isinstance(child, (Python3Parser.StmtContext, Python3Parser.Simple_stmtsContext)):
+                result = self.visit(child)
+                if result:
+                    result = re.sub(
+                        r'\bself\.([a-z])(\w*)',
+                        lambda m: f'{receiver}.{m.group(1).upper()}{m.group(2)}',
+                        result
+                    )
+                    lines.append(result)
+        self.indent_level -= 1
+        return "\n".join(l for l in lines if l)
 
     def _translate_params(self, ctx: Python3Parser.ParametersContext):
         """Traduce parámetros de Python a Go. Devuelve (params_str, defaults_dict)."""
@@ -325,10 +653,32 @@ class PythonToGoVisitor(Python3ParserVisitor):
         return found
 
     def visitReturn_stmt(self, ctx: Python3Parser.Return_stmtContext):
+        if self.in_generator and ctx.testlist():
+            val = self.visit(ctx.testlist())
+            return f"{self.indent()}{self.gen_ch_name} <- {val}\n{self.indent()}return"
         if ctx.testlist():
             val = self.visit(ctx.testlist())
             return f"{self.indent()}return {val}"
         return f"{self.indent()}return"
+
+    def visitPass_stmt(self, ctx: Python3Parser.Pass_stmtContext):
+        return f"{self.indent()}// pass"
+
+    def visitBreak_stmt(self, ctx: Python3Parser.Break_stmtContext):
+        return f"{self.indent()}break"
+
+    def visitContinue_stmt(self, ctx: Python3Parser.Continue_stmtContext):
+        return f"{self.indent()}continue"
+
+    def visitRaise_stmt(self, ctx: Python3Parser.Raise_stmtContext):
+        tests = ctx.test()
+        if not tests:
+            return f'{self.indent()}panic("error")'
+        exc = self.visit(tests[0])
+        if len(tests) == 2:
+            cause = self.visit(tests[1])
+            return f'{self.indent()}panic({exc})  // from: {cause}'
+        return f'{self.indent()}panic({exc})'
 
     # ─────────────────────────────────────────────
     # Bucles: while y for
@@ -645,10 +995,13 @@ class PythonToGoVisitor(Python3ParserVisitor):
         return f"({left} {op} {right})"
 
     def visitAtom_expr(self, ctx: Python3Parser.Atom_exprContext):
-        # atom trailer* (llamadas, índices, atributos)
+        # AWAIT? atom trailer*
+        has_await = ctx.getChild(0).getText() == 'await'
         base = self.visit(ctx.atom())
         for trailer in ctx.trailer():
             base = self._apply_trailer(base, trailer)
+        if has_await:
+            return f"<-{base}"
         return base
 
     def _apply_trailer(self, base: str, trailer: Python3Parser.TrailerContext) -> str:
