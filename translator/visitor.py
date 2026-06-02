@@ -92,6 +92,15 @@ class PythonToGoVisitor(Python3ParserVisitor):
     def visitSimple_stmt(self, ctx: Python3Parser.Simple_stmtContext):
         return self.visit(ctx.getChild(0))
 
+    def visitBreak_stmt(self, ctx: Python3Parser.Break_stmtContext):
+        return f"{self.indent()}break"
+
+    def visitContinue_stmt(self, ctx: Python3Parser.Continue_stmtContext):
+        return f"{self.indent()}continue"
+
+    def visitPass_stmt(self, ctx: Python3Parser.Pass_stmtContext):
+        return f"{self.indent()}// pass"
+
     # ─────────────────────────────────────────────
     # Compound statements (if/elif/else)
     # ─────────────────────────────────────────────
@@ -330,6 +339,15 @@ class PythonToGoVisitor(Python3ParserVisitor):
             return f"{self.indent()}return {val}"
         return f"{self.indent()}return"
 
+    def visitBreak_stmt(self, ctx: Python3Parser.Break_stmtContext):
+        return f"{self.indent()}break"
+
+    def visitContinue_stmt(self, ctx: Python3Parser.Continue_stmtContext):
+        return f"{self.indent()}continue"
+
+    def visitPass_stmt(self, ctx: Python3Parser.Pass_stmtContext):
+        return f"{self.indent()}// pass"
+
     # ─────────────────────────────────────────────
     # Bucles: while y for
     # ─────────────────────────────────────────────
@@ -510,15 +528,24 @@ class PythonToGoVisitor(Python3ParserVisitor):
             lhs = self.visit(lhs_ctx)
             rhs = self.visit(rhs_ctx)
 
-            # Asignación múltiple: a, b = 0, 1
+            # Asignación múltiple / unpacking: a, b = 0, 1  o  (x, y) = point
+            # Limpiar paréntesis externos del lhs si los tiene
+            if lhs.startswith("(") and lhs.endswith(")"):
+                lhs = lhs[1:-1]
+            if rhs.startswith("(") and rhs.endswith(")"):
+                rhs = rhs[1:-1]
+
             lhs_has_comma = any(
                 lhs_ctx.getChild(i).getText() == ","
                 for i in range(lhs_ctx.getChildCount())
-            )
+            ) or "," in lhs
 
             # Determinar si usar := o =
             if lhs_has_comma:
-                vars_list = [v.strip() for v in lhs.split(",")]
+                # Limpiar paréntesis de unpacking: (x, y) → x, y
+                lhs_clean = lhs.strip("() ")
+                vars_list = [v.strip().strip("()") for v in lhs_clean.split(",")]
+                lhs = ", ".join(vars_list)
                 any_new = any(v not in self.declared_vars for v in vars_list)
                 op = ":=" if any_new else "="
                 for v in vars_list:
@@ -581,6 +608,16 @@ class PythonToGoVisitor(Python3ParserVisitor):
         return self.visit(ctx.comparison())
 
     def visitComparison(self, ctx: Python3Parser.ComparisonContext):
+        # Caso especial: x in y  /  x not in y
+        if ctx.comp_op():
+            for i, op_ctx in enumerate(ctx.comp_op()):
+                op_text = op_ctx.getText()
+                if op_text in ("in", "notin"):
+                    left  = self.visit(ctx.expr(i))
+                    right = self.visit(ctx.expr(i + 1))
+                    negated = op_text == "notin"
+                    return self._is_in_expr(left, right, negated)
+
         parts = [self.visit(ctx.expr(0))]
         for i, op_ctx in enumerate(ctx.comp_op()):
             op = self._comp_op(op_ctx)
@@ -593,12 +630,31 @@ class PythonToGoVisitor(Python3ParserVisitor):
         mapping = {
             "<": "<", ">": ">", "==": "==", ">=": ">=", "<=": "<=",
             "!=": "!=", "<>": "!=",
-            "in": "/* in */",       # requiere lógica especial
-            "notin": "/* not in */",
             "is": "==",
             "isnot": "!=",
         }
         return mapping.get(text, text)
+
+    def _is_in_expr(self, left: str, right: str, negated: bool = False) -> str:
+        """Genera la comprobación Go equivalente a 'x in container'."""
+        neg = "!" if negated else ""
+        # Para strings: strings.Contains(right, left)
+        if right.startswith('"') or right.startswith('`'):
+            self.add_import("strings")
+            result = f"strings.Contains({right}, {left})"
+            return f"!{result}" if negated else result
+        # Para slices/maps: IIFE con loop
+        ind = self.indent()
+        true_val  = "false" if negated else "true"
+        false_val = "true"  if negated else "false"
+        return "\n".join([
+            f"func() bool {{",
+            f"{ind}\tfor _, _v := range {right} {{",
+            f"{ind}\t\tif _v == {left} {{ return {true_val} }}",
+            f"{ind}\t}}",
+            f"{ind}\treturn {false_val}",
+            f"{ind}}}()",
+        ])
 
     def visitExpr(self, ctx: Python3Parser.ExprContext):
         if ctx.getChildCount() == 1:
