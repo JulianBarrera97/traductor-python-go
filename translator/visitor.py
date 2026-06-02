@@ -12,6 +12,7 @@ class PythonToGoVisitor(Python3ParserVisitor):
         self.indent_level = 0
         self.output = []
         self.declared_vars = set()  # variables ya declaradas → usar = en vez de :=
+        self.string_vars = set()    # variables que sabemos son strings
         self.current_class = None   # nombre de la clase en visita actual
         self.class_fields  = []     # campos detectados en __init__ de la clase
         self.in_generator  = False  # True cuando se visita cuerpo de generador
@@ -69,9 +70,17 @@ class PythonToGoVisitor(Python3ParserVisitor):
         for child in ctx.children:
             if isinstance(child, Python3Parser.StmtContext):
                 compound = child.compound_stmt() if hasattr(child, 'compound_stmt') else None
-                is_funcdef   = (compound is not None and compound.funcdef()    is not None)
-                is_classdef  = (compound is not None and compound.classdef()  is not None)
-                is_asyncstmt = (compound is not None and compound.async_stmt() is not None)
+                # En ANTLR, compound_stmt() puede devolver un objeto vacío en vez de None
+                # Verificamos que tenga hijos para confirmar que existe
+                def _has(ctx, method):
+                    try:
+                        r = getattr(ctx, method)()
+                        return r is not None and r.getChildCount() > 0
+                    except Exception:
+                        return False
+                is_funcdef   = compound is not None and _has(compound, "funcdef")
+                is_classdef  = compound is not None and _has(compound, "classdef")
+                is_asyncstmt = compound is not None and _has(compound, "async_stmt")
                 if is_funcdef or is_classdef or is_asyncstmt:
                     top_funcs.append(self.visit(child))
                 else:
@@ -232,6 +241,10 @@ class PythonToGoVisitor(Python3ParserVisitor):
         return f"/* {ctx.getText()} */"
 
     def visitTry_stmt(self, ctx: Python3Parser.Try_stmtContext):
+        saved_vars = self.declared_vars.copy()
+        saved_str_vars = self.string_vars.copy()
+        self.declared_vars = set()
+        self.string_vars = set()
         ind = self.indent()
         i1  = ind + "\t"
         i2  = ind + "\t\t"
@@ -274,16 +287,19 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 alias = self._except_alias(clause)
                 if alias:
                     lines.append(f"{i2}\t{alias} := _r")
-                self.indent_level += 3
+                # El cuerpo del except está dentro de:
+                # func() { defer func() { if _r != nil { <HERE> } } }
+                # = ind_level_try + 3 niveles
+                saved_level = self.indent_level
+                self.indent_level += 2
                 eb = self._visit_block(exc_block)
-                self.indent_level -= 3
+                self.indent_level = saved_level
                 lines.append(eb)
             lines.append(f"{i2}}}")
             lines.append(f"{i1}}}()")
 
-        self.indent_level += 1
+        # _visit_block añade +1 internamente, así que no pre-incrementamos
         tb = self._visit_block(try_block)
-        self.indent_level -= 1
         lines.append(tb)
 
         if else_block:
@@ -294,6 +310,8 @@ class PythonToGoVisitor(Python3ParserVisitor):
             lines.append(eb)
 
         lines.append(f"{ind}}}()")
+        self.declared_vars = saved_vars
+        self.string_vars = saved_str_vars
         return "\n".join(lines)
 
     def _except_alias(self, clause) -> str:
@@ -389,6 +407,15 @@ class PythonToGoVisitor(Python3ParserVisitor):
         # 'def' name parameters ('->' test)? ':' block
         name = ctx.name().getText()
         params_go, defaults = self._translate_params(ctx.parameters())
+        # Guardar scope exterior y arrancar scope limpio para la función
+        saved_vars = self.declared_vars.copy()
+        saved_str_vars = self.string_vars.copy()
+        self.declared_vars = set()
+        self.string_vars = set()
+        for p in params_go.split(","):
+            pname = p.strip().split(" ")[0]
+            if pname and pname not in ("...", ""):
+                self.declared_vars.add(pname)
 
         if self._is_generator(ctx.block()):
             return self._translate_generator_func(name, params_go, defaults, ctx.block())
@@ -408,6 +435,7 @@ class PythonToGoVisitor(Python3ParserVisitor):
         lines.append(f"func {name}({params_go}){rt} {{")
         lines.append(body)
         lines.append("}")
+        self.declared_vars = saved_vars
         return "\n".join(lines)
 
     # ─────────────────────────────────────────────
@@ -891,12 +919,23 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 op = ":=" if any_new else "="
                 for v in vars_list:
                     self.declared_vars.add(v)
+                # x, y = point  →  x, y := point[0], point[1]
+                rhs_has_comma = "," in rhs
+                rhs_is_literal = rhs.startswith("[]") or rhs.startswith("{") or rhs.startswith("(")
+                if not rhs_has_comma and not rhs_is_literal:
+                    rhs = ", ".join(f"{rhs}[{i}]" for i in range(len(vars_list)))
             elif "[" in lhs or "." in lhs:
                 # Acceso a índice o atributo → siempre =
                 op = "="
             else:
                 op = "=" if lhs in self.declared_vars else ":="
                 self.declared_vars.add(lhs)
+                # Rastrear variables string
+                rhs_stripped = rhs.strip()
+                if (rhs_stripped.startswith('"') or rhs_stripped.startswith("'") or
+                        rhs_stripped.startswith('f"') or rhs_stripped.startswith("f'") or
+                        rhs_stripped.startswith('`')):
+                    self.string_vars.add(lhs)
 
             return f"{self.indent()}{lhs} {op} {rhs}"
 
@@ -954,10 +993,14 @@ class PythonToGoVisitor(Python3ParserVisitor):
             for i, op_ctx in enumerate(ctx.comp_op()):
                 op_text = op_ctx.getText()
                 if op_text in ("in", "notin"):
-                    left  = self.visit(ctx.expr(i))
-                    right = self.visit(ctx.expr(i + 1))
+                    left_ctx  = ctx.expr(i)
+                    right_ctx = ctx.expr(i + 1)
+                    left  = self.visit(left_ctx)
+                    right = self.visit(right_ctx)
                     negated = op_text == "notin"
-                    return self._is_in_expr(left, right, negated)
+                    left_is_str  = self._expr_is_string(left_ctx)
+                    right_is_str = self._expr_is_string(right_ctx)
+                    return self._is_in_expr(left, right, negated, left_is_str, right_is_str)
 
         parts = [self.visit(ctx.expr(0))]
         for i, op_ctx in enumerate(ctx.comp_op()):
@@ -976,20 +1019,33 @@ class PythonToGoVisitor(Python3ParserVisitor):
         }
         return mapping.get(text, text)
 
-    def _is_in_expr(self, left: str, right: str, negated: bool = False) -> str:
+    def _expr_is_string(self, ctx) -> bool:
+        """Detecta si una expresión es un string literal o variable string conocida."""
+        text = ctx.getText()
+        if (text.startswith('"') or text.startswith("'") or
+                text.startswith('f"') or text.startswith("f'")):
+            return True
+        # Variable declarada como string
+        return text in self.string_vars
+
+    def _is_in_expr(self, left: str, right: str, negated: bool = False,
+                    left_is_str: bool = False, right_is_str: bool = False) -> str:
         """Genera la comprobación Go equivalente a 'x in container'."""
-        neg = "!" if negated else ""
-        # Para strings: strings.Contains(right, left)
-        if right.startswith('"') or right.startswith('`'):
+        left_str  = left_is_str  or left.startswith('"')  or left.startswith('`')
+        right_str = right_is_str or right.startswith('"') or right.startswith('`')
+        # Solo usar strings.Contains cuando el contenedor (right) es string
+        # o cuando left es string y right también lo es (substring search)
+        if right_str:
             self.add_import("strings")
             result = f"strings.Contains({right}, {left})"
-            return f"!{result}" if negated else result
-        # Para slices/maps: IIFE con loop
+            return f"!({result})" if negated else result
+        # left es string literal pero right es slice → buscar por igualdad en loop
+        # (Python: "hola" in list → check if "hola" is element)
         ind = self.indent()
         true_val  = "false" if negated else "true"
         false_val = "true"  if negated else "false"
         return "\n".join([
-            f"func() bool {{",
+            "func() bool {",
             f"{ind}\tfor _, _v := range {right} {{",
             f"{ind}\t\tif _v == {left} {{ return {true_val} }}",
             f"{ind}\t}}",
@@ -1210,6 +1266,9 @@ class PythonToGoVisitor(Python3ParserVisitor):
             self.add_import("fmt")
             return f'fmt.Sprintf("%v", {args})'
 
+        # Si la función empieza con mayúscula → posible constructor de clase
+        if func and func[0].isupper() and "." not in func:
+            return f"New{func}({args})"
         # Cualquier otra llamada: se pasa tal cual
         return f"{func}({args})"
 
