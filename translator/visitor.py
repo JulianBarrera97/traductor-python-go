@@ -711,11 +711,28 @@ class PythonToGoVisitor(Python3ParserVisitor):
         tests = ctx.test()
         if not tests:
             return f'{self.indent()}panic("error")'
-        exc = self.visit(tests[0])
+        exc_text = tests[0].getText()
+        exc_visited = self.visit(tests[0])
+        # Detectar ValueError("msg") y similares → fmt.Errorf
+        import re
+        m = re.match(r'(\w+Error|Exception|RuntimeError|TypeError|KeyError|IndexError)\((.+)\)', exc_text)
+        if m:
+            self.add_import("fmt")
+            msg_node = self.visit(tests[0].or_test(0)) if hasattr(tests[0], 'or_test') else exc_visited
+            # Extraer el argumento: visitar el trailer de la llamada
+            # Usar exc_visited que ya está traducido (NewXxx(args))
+            # Reemplazar NewXxxError(args) por fmt.Errorf(args)
+            exc_go = re.sub(r'New\w+\((.+)\)', r'fmt.Errorf(\1)', exc_visited)
+            if "fmt.Errorf" not in exc_go:
+                exc_go = f'fmt.Errorf({exc_visited})'
+            if len(tests) == 2:
+                cause = self.visit(tests[1])
+                return f'{self.indent()}panic({exc_go})  // from: {cause}'
+            return f'{self.indent()}panic({exc_go})'
         if len(tests) == 2:
             cause = self.visit(tests[1])
-            return f'{self.indent()}panic({exc})  // from: {cause}'
-        return f'{self.indent()}panic({exc})'
+            return f'{self.indent()}panic({exc_visited})  // from: {cause}'
+        return f'{self.indent()}panic({exc_visited})'
 
     # ─────────────────────────────────────────────
     # Bucles: while y for
@@ -725,12 +742,25 @@ class PythonToGoVisitor(Python3ParserVisitor):
         # while test ':' block ('else' ':' block)?
         cond = self.visit(ctx.test())
         body = self._visit_block(ctx.block(0))
-        lines = [f"{self.indent()}for {cond} {{", body, f"{self.indent()}}}"]
-        # else en while no existe en Go
-        if len(ctx.block()) > 1:
+        has_else = len(ctx.block()) > 1
+
+        if has_else:
+            flag = "_broke"
+            ind = self.indent()
+            i1  = ind + "\t"
             else_body = self._visit_block(ctx.block(1))
-            lines.append(f"{self.indent()}// else del while (no existe en Go):")
-            lines.append(else_body)
+            lines = [
+                f"{ind}{flag} := false",
+                f"{ind}for {cond} {{",
+                body,
+                f"{ind}}}",
+                f"{ind}if !{flag} {{",
+                else_body,
+                f"{ind}}}",
+            ]
+            return "\n".join(lines)
+
+        lines = [f"{self.indent()}for {cond} {{", body, f"{self.indent()}}}"]
         return "\n".join(lines)
 
     def visitFor_stmt(self, ctx: Python3Parser.For_stmtContext):
@@ -765,14 +795,32 @@ class PythonToGoVisitor(Python3ParserVisitor):
         elif "," in targets:
             header = f"{self.indent()}for {targets} := range {iterable} {{"
         else:
-            header = f"{self.indent()}for _, {targets} := range {iterable} {{"
+            # Si el iterable es un canal (función generadora conocida), no usar _
+            # Heurística: si termina en '()' o tiene 'chan' en su texto, es canal
+            iterable_raw = iterable_ctx.getText()
+            is_channel = (iterable_raw.endswith(")")
+                          and not iterable_raw.startswith("range(")
+                          and not iterable_raw.startswith("enumerate("))
+            if is_channel:
+                header = f"{self.indent()}for {targets} := range {iterable} {{"
+            else:
+                header = f"{self.indent()}for _, {targets} := range {iterable} {{"
         lines = [header, body, f"{self.indent()}}}"]
 
-        # else en for no existe en Go
         if len(ctx.block()) > 1:
+            flag = "_broke"
+            ind  = self.indent()
             else_body = self._visit_block(ctx.block(1))
-            lines.append(f"{self.indent()}// else del for (no existe en Go):")
-            lines.append(else_body)
+            # Reinsertar con flag pattern
+            lines = [
+                f"{ind}{flag} := false",
+                header.replace(" {", f" {{ // for-else"),
+                body,
+                f"{ind}}}",
+                f"{ind}if !{flag} {{",
+                else_body,
+                f"{ind}}}",
+            ]
         return "\n".join(lines)
 
     def _for_range(self, targets: str, iterable_ctx, block_ctx) -> str:
@@ -816,16 +864,55 @@ class PythonToGoVisitor(Python3ParserVisitor):
         elif step == "-1":
             post = f"{var}--"
         else:
-            post = f"{var} += {step}"
+            try:
+                step_int = int(step)
+                if step_int < 0:
+                    post = f"{var} -= {abs(step_int)}"
+                else:
+                    post = f"{var} += {step}"
+            except ValueError:
+                post = f"{var} += {step}"
 
         header = f"{self.indent()}for {var} := {start}; {cond}; {post} {{"
         return "\n".join([header, body, f"{self.indent()}}}"])
 
     def _for_enumerate(self, targets: str, iterable_ctx, block_ctx) -> str:
-        """Traduce for i, v in enumerate(iterable) → for i, v := range iterable"""
+        """Traduce for i, v in enumerate(iterable, start=N) → C-style loop con offset"""
         args = self._extract_call_args(iterable_ctx)
         inner = args[0] if args else self.visit(iterable_ctx)
+
+        # Detectar start=N (puede venir como "N" o como "start=N")
+        start_offset = "0"
+        if len(args) >= 2:
+            raw = args[1]
+            if raw.startswith("start="):
+                start_offset = raw[len("start="):]
+            else:
+                start_offset = raw
+
         body = self._visit_block(block_ctx)
+
+        # Separar los targets: i, v
+        target_parts = [t.strip() for t in targets.split(",")]
+        if len(target_parts) == 2:
+            idx_var, val_var = target_parts
+            ind = self.indent()
+            if start_offset == "0":
+                header = f"{ind}for {idx_var}, {val_var} := range {inner} {{"
+            else:
+                # Generar loop con counter manual
+                tmp = "_enumSlice"
+                lines = [
+                    f"{ind}{tmp} := {inner}",
+                    f"{ind}for _ei, {val_var} := range {tmp} {{",
+                    f"{ind}\t{idx_var} := _ei + {start_offset}",
+                    body,
+                    f"{ind}}}",
+                ]
+                return "\n".join(lines)
+            return "\n".join([header, body, f"{ind}}}"])
+
+        # Fallback
         header = f"{self.indent()}for {targets} := range {inner} {{"
         return "\n".join([header, body, f"{self.indent()}}}"])
 
@@ -909,11 +996,34 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 for i in range(lhs_ctx.getChildCount())
             ) or "," in lhs
 
+            # Detectar star unpacking en lhs: primero, *resto = [1,2,3,4,5]
+            # El lhs puede contener un '*' (star_expr)
+            lhs_has_star = "*" in lhs
+
             # Determinar si usar := o =
-            if lhs_has_comma:
+            if lhs_has_comma or lhs_has_star:
                 # Limpiar paréntesis de unpacking: (x, y) → x, y
                 lhs_clean = lhs.strip("() ")
-                vars_list = [v.strip().strip("()") for v in lhs_clean.split(",")]
+                vars_list_raw = [v.strip().strip("()") for v in lhs_clean.split(",")]
+
+                if lhs_has_star:
+                    # primero, *resto = lista → Go: primero := lista[0]; resto := lista[1:]
+                    star_idx = next(
+                        (i for i, v in enumerate(vars_list_raw) if v.startswith("*")), None
+                    )
+                    rhs_var = rhs  # la lista fuente
+                    lines_out = []
+                    for k, v in enumerate(vars_list_raw):
+                        clean_v = v.lstrip("*")
+                        op_k = "=" if clean_v in self.declared_vars else ":="
+                        self.declared_vars.add(clean_v)
+                        if v.startswith("*"):
+                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {rhs_var}[{k}:]")
+                        else:
+                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {rhs_var}[{k}]")
+                    return "\n".join(lines_out)
+
+                vars_list = vars_list_raw
                 lhs = ", ".join(vars_list)
                 any_new = any(v not in self.declared_vars for v in vars_list)
                 op = ":=" if any_new else "="
@@ -921,13 +1031,36 @@ class PythonToGoVisitor(Python3ParserVisitor):
                     self.declared_vars.add(v)
                 # x, y = point  →  x, y := point[0], point[1]
                 rhs_has_comma = "," in rhs
-                rhs_is_literal = rhs.startswith("[]") or rhs.startswith("{") or rhs.startswith("(")
-                if not rhs_has_comma and not rhs_is_literal:
+                rhs_is_literal = rhs.startswith("[]") or rhs.startswith("{")
+                rhs_is_tuple   = rhs_has_comma and not rhs.startswith("[")
+                if rhs_is_tuple:
+                    # a, b, c = 1, 2, 3  →  a, b, c := 1, 2, 3  (directo)
+                    pass
+                elif not rhs_has_comma and not rhs_is_literal:
+                    # x, y = point  →  x, y := point[0], point[1]
                     rhs = ", ".join(f"{rhs}[{i}]" for i in range(len(vars_list)))
             elif "[" in lhs or "." in lhs:
                 # Acceso a índice o atributo → siempre =
                 op = "="
             else:
+                # Detectar si el RHS es una tupla literal (tiene coma al nivel raíz,
+                # no dentro de paréntesis de una llamada a función)
+                def _has_top_level_comma(s):
+                    depth = 0
+                    for ch in s:
+                        if ch in "([{":
+                            depth += 1
+                        elif ch in ")]}":
+                            depth -= 1
+                        elif ch == "," and depth == 0:
+                            return True
+                    return False
+
+                rhs_is_bare_tuple = (_has_top_level_comma(rhs)
+                                     and not rhs.startswith("[")
+                                     and not rhs.startswith("map"))
+                if rhs_is_bare_tuple:
+                    rhs = f"[]interface{{}}{{{rhs}}}"
                 op = "=" if lhs in self.declared_vars else ":="
                 self.declared_vars.add(lhs)
                 # Rastrear variables string
@@ -972,10 +1105,14 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
     def visitOr_test(self, ctx: Python3Parser.Or_testContext):
         parts = [self.visit(ctx.and_test(i)) for i in range(len(ctx.and_test()))]
+        if len(parts) == 1:
+            return parts[0]
         return " || ".join(parts)
 
     def visitAnd_test(self, ctx: Python3Parser.And_testContext):
         parts = [self.visit(ctx.not_test(i)) for i in range(len(ctx.not_test()))]
+        if len(parts) == 1:
+            return parts[0]
         return " && ".join(parts)
 
     def visitNot_test(self, ctx: Python3Parser.Not_testContext):
@@ -1089,10 +1226,17 @@ class PythonToGoVisitor(Python3ParserVisitor):
             return f"({left} {op} {right})"
 
         if op == "*":
-            # Solo advertir si alguno de los operandos parece un string literal
-            if left.startswith('"') or right.startswith('"') or left.startswith('`') or right.startswith('`'):
+            # Detectar string * int: literal o variable conocida como string
+            left_is_str  = (left.startswith('"') or left.startswith('`')
+                            or left in self.string_vars)
+            right_is_str = (right.startswith('"') or right.startswith('`')
+                            or right in self.string_vars)
+            if left_is_str:
                 self.add_import("strings")
                 return f"strings.Repeat({left}, {right})"
+            if right_is_str:
+                self.add_import("strings")
+                return f"strings.Repeat({right}, {left})"
             return f"({left} * {right})"
 
         return f"({left} {op} {right})"
@@ -1118,8 +1262,29 @@ class PythonToGoVisitor(Python3ParserVisitor):
         # Índice / slice: base[...]
         if first == "[":
             subscript_ctx = trailer.subscriptlist()
+            if subscript_ctx is None:
+                return f"{base}[]"
+
+            subs = subscript_ctx.subscript_()
+
+            # Slice (tiene ':' entre los hijos del subscript)
+            if len(subs) == 1:
+                sub = subs[0]
+                children_texts = [sub.getChild(k).getText()
+                                  for k in range(sub.getChildCount())]
+                is_slice = ":" in children_texts
+                if is_slice:
+                    return self._translate_slice(base, sub)
+                # Índice simple
+                idx = self.visit(sub.getChild(0))
+                idx = self._fix_negative_index(base, idx, subscript_ctx)
+                # Type assertion para doble indexación
+                if base.endswith("]") and "interface{}" not in base:
+                    return f"{base}.([]interface{{}})[{idx}]"
+                return f"{base}[{idx}]"
+
+            # Múltiples subscripts (raramente usado)
             subscript = self.visit(subscript_ctx)
-            # Detectar índice negativo: base[-1] → base[len(base)-1]
             subscript = self._fix_negative_index(base, subscript, subscript_ctx)
             return f"{base}[{subscript}]"
 
@@ -1146,6 +1311,25 @@ class PythonToGoVisitor(Python3ParserVisitor):
     def _translate_call(self, func: str, args: str,
                         trailer: Python3Parser.TrailerContext) -> str:
         """Traduce llamadas builtin especiales."""
+
+        # ── sort con key= ─────────────────────────────────────────────────
+        if func.endswith(".sort"):
+            base = func[:-5]
+            self.add_import("sort")
+            self.add_import("fmt")
+            if args:
+                # args puede ser "key=func(...)" o solo una función
+                key_func = args
+                if args.startswith("key="):
+                    key_func = args[4:]
+                return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
+                        f"{self.indent()}\t_ki := ({key_func})({base}[_i])\n"
+                        f"{self.indent()}\t_kj := ({key_func})({base}[_j])\n"
+                        f"{self.indent()}\treturn fmt.Sprintf(\"%v\", _ki) < fmt.Sprintf(\"%v\", _kj)\n"
+                        f"{self.indent()}}})")
+            return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
+                    f"{self.indent()}\treturn fmt.Sprintf(\"%v\", {base}[_i]) < fmt.Sprintf(\"%v\", {base}[_j])\n"
+                    f"{self.indent()}}})")
 
         # ── append ────────────────────────────────────────────────────────
         if func.endswith(".append"):
@@ -1238,14 +1422,34 @@ class PythonToGoVisitor(Python3ParserVisitor):
             return f"append({base}, {args})"
 
         # ── métodos de lista: .copy(), .pop(), etc. → comentario
-        list_methods = {"sort", "reverse", "clear", "copy", "count", "index", "insert", "remove", "pop"}
+        list_methods = {"sort", "reverse", "clear", "count", "index", "insert", "remove", "pop"}
         dot_idx = func.rfind(".")
         if dot_idx != -1 and func[dot_idx+1:] in list_methods:
             method = func[dot_idx+1:]
             base = func[:dot_idx]
+            if method == "sort":
+                self.add_import("sort")
+                key_arg = args.strip()
+                if key_arg.startswith("key="):
+                    key_func = key_arg[4:]
+                    return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
+                            f"{self.indent()}\treturn ({key_func})({base}[_i]).(int) < ({key_func})({base}[_j]).(int)\n"
+                            f"{self.indent()}}})")
+                if key_arg:
+                    return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
+                            f"{self.indent()}\treturn ({key_arg})({base}[_i]).(int) < ({key_arg})({base}[_j]).(int)\n"
+                            f"{self.indent()}}})")
+                return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
+                        f"{self.indent()}\treturn fmt.Sprintf(\"%v\", {base}[_i]) < fmt.Sprintf(\"%v\", {base}[_j])\n"
+                        f"{self.indent()}}})")
             if method == "pop":
+                # Si la base es una variable (no contiene '[' inline), emitir el método Go
+                # ya que puede ser una struct con método pop() definido
+                if "[" not in base:
+                    return f"{base}.{method}({args})"
+                # Slice inline: base[-1]
                 idx_arg = args if args else f"len({base})-1"
-                return f"{base}[{idx_arg}] /* pop: remover elemento manualmente en Go */"
+                return f"{base}[{idx_arg}]"
             if method == "copy":
                 return f"append([]interface{{}}{{}}, {base}...)"
             # Para el resto: llamada directa con comentario
@@ -1493,14 +1697,36 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
     def _translate_slice(self, base: str, sub: Python3Parser.Subscript_Context) -> str:
         """Traduce slicing: base[start:stop:step]"""
-        tests = sub.test()
-        has_step = sub.sliceop() is not None
-
-        start = self.visit(tests[0]) if len(tests) > 0 else ""
-        stop  = self.visit(tests[1]) if len(tests) > 1 else ""
+        # Reconstruir start/stop desde los hijos directos para manejar
+        # slices parciales (::2, :3, 1:, etc.) correctamente
+        children = list(sub.children)
+        start = ""
+        stop  = ""
         step  = ""
-        if has_step and sub.sliceop().test():
-            step = self.visit(sub.sliceop().test())
+        i = 0
+        # ¿Hay start antes del primer ':'?
+        if i < len(children) and children[i].getText() != ":":
+            node = children[i]
+            if node is not None:
+                start = self.visit(node)
+            i += 1
+        # Saltar primer ':'
+        if i < len(children) and children[i].getText() == ":":
+            i += 1
+        # ¿Hay stop antes del segundo ':' o fin?
+        if i < len(children) and children[i].getText() != ":":
+            from antlr4 import TerminalNode
+            if not isinstance(children[i], Python3Parser.SliceopContext):
+                node = children[i]
+                if node is not None:
+                    stop = self.visit(node)
+                i += 1
+        # ¿Hay sliceop (segundo ':')?
+        has_step = sub.sliceop() is not None
+        if has_step and sub.sliceop() is not None:
+            sliceop = sub.sliceop()
+            if sliceop.test() is not None:
+                step = self.visit(sliceop.test())
 
         # Normalizar índices negativos en start/stop
         if start.startswith("-") and start[1:].isdigit():
