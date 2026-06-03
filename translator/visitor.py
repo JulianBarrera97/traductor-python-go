@@ -13,6 +13,7 @@ class PythonToGoVisitor(Python3ParserVisitor):
         self.output = []
         self.declared_vars = set()  # variables ya declaradas → usar = en vez de :=
         self.string_vars = set()    # variables que sabemos son strings
+        self.int_slice_vars = set() # variables que sabemos son []int
         self.current_class = None   # nombre de la clase en visita actual
         self.class_fields  = []     # campos detectados en __init__ de la clase
         self.in_generator  = False  # True cuando se visita cuerpo de generador
@@ -874,6 +875,9 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
     def _for_c_style(self, var: str, start: str, stop: str, step: str, block_ctx) -> str:
         """Genera un for estilo C: for i := start; i < stop; i += step"""
+        # En Go, _ no se puede usar como variable de loop; usar _i en su lugar
+        if var == "_":
+            var = "_i"
         body = self._visit_block(block_ctx)
         # step negativo → condición invertida
         try:
@@ -1008,6 +1012,7 @@ class PythonToGoVisitor(Python3ParserVisitor):
             lhs_ctx = exprs[0]
             rhs_ctx = exprs[1]
             lhs = self.visit(lhs_ctx)
+            self._last_lhs = lhs.strip('() ')
             rhs = self.visit(rhs_ctx)
 
             # Asignación múltiple / unpacking: a, b = 0, 1  o  (x, y) = point
@@ -1061,6 +1066,41 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
                 vars_list = vars_list_raw
                 lhs = ", ".join(vars_list)
+
+                # ── Interceptar __map__conv__iterable ─────────────────────────
+                # Patrón: n, t = map(int, input().split())
+                # Genera:  _parts := strings.Fields(_readLine())
+                #           n, _ := strconv.Atoi(_parts[0])
+                #           t, _ := strconv.Atoi(_parts[1])
+                if rhs.startswith("__map__"):
+                    rest = rhs[len("__map__"):]
+                    conv, iterable = rest.split("__", 1)
+                    tmp = "_mapParts"
+                    lines_out = []
+                    op_tmp = "=" if tmp in self.declared_vars else ":="
+                    self.declared_vars.add(tmp)
+                    lines_out.append(f"{self.indent()}{tmp} {op_tmp} {iterable}")
+                    for k, v in enumerate(vars_list):
+                        v = v.strip()
+                        op_v = "=" if v in self.declared_vars else ":="
+                        self.declared_vars.add(v)
+                        if conv == "int":
+                            self.add_import("strconv")
+                            lines_out.append(
+                                f"{self.indent()}{v}, _ {op_v} strconv.Atoi({tmp}[{k}])"
+                            )
+                        elif conv == "float":
+                            self.add_import("strconv")
+                            lines_out.append(
+                                f"{self.indent()}{v}, _ {op_v} strconv.ParseFloat({tmp}[{k}], 64)"
+                            )
+                        else:
+                            lines_out.append(
+                                f"{self.indent()}{v} {op_v} {tmp}[{k}]"
+                            )
+                    return "\n".join(lines_out)
+                # ── fin __map__ ────────────────────────────────────────────────
+
                 # Si alguna variable del lhs es una indexación (contiene '[')
                 # o un acceso a atributo (contiene '.'), se debe usar = en lugar de :=
                 # porque Go no permite := en el lado izquierdo de una indexación.
@@ -1101,13 +1141,16 @@ class PythonToGoVisitor(Python3ParserVisitor):
 
                 rhs_is_bare_tuple = (_has_top_level_comma(rhs)
                                      and not rhs.startswith("[")
-                                     and not rhs.startswith("map"))
+                                     and not rhs.startswith("map")
+                                     and not rhs.startswith("func()"))
                 if rhs_is_bare_tuple:
                     rhs = f"[]interface{{}}{{{rhs}}}"
                 op = "=" if lhs in self.declared_vars else ":="
                 self.declared_vars.add(lhs)
-                # Rastrear variables string
+                # Rastrear variables string / []int
                 rhs_stripped = rhs.strip()
+                if rhs_stripped.startswith("func() []int") or rhs_stripped.startswith("func() []float"):
+                    self.int_slice_vars.add(lhs)
                 if (rhs_stripped.startswith('"') or rhs_stripped.startswith("'") or
                         rhs_stripped.startswith('f"') or rhs_stripped.startswith("f'") or
                         rhs_stripped.startswith('`')):
@@ -1401,9 +1444,11 @@ class PythonToGoVisitor(Python3ParserVisitor):
         if func.endswith(".sort"):
             base = func[:-5]
             self.add_import("sort")
+            # Si la variable es []int conocida → sort.Ints es más eficiente y correcto
+            if base in self.int_slice_vars:
+                return f"sort.Ints({base})"
             self.add_import("fmt")
             if args:
-                # args puede ser "key=func(...)" o solo una función
                 key_func = args
                 if args.startswith("key="):
                     key_func = args[4:]
@@ -1517,6 +1562,9 @@ class PythonToGoVisitor(Python3ParserVisitor):
                     return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
                             f"{self.indent()}\treturn ({key_arg})({base}[_i]).(int) < ({key_arg})({base}[_j]).(int)\n"
                             f"{self.indent()}}})")
+                # Si la variable es conocida como []int, usar comparación numérica
+                if base in self.int_slice_vars:
+                    return (f"sort.Ints({base})")
                 return (f"sort.Slice({base}, func(_i, _j int) bool {{\n"
                         f"{self.indent()}\treturn fmt.Sprintf(\"%v\", {base}[_i]) < fmt.Sprintf(\"%v\", {base}[_j])\n"
                         f"{self.indent()}}})")
@@ -1537,19 +1585,54 @@ class PythonToGoVisitor(Python3ParserVisitor):
         if func == "list":
             if not args:
                 return "[]interface{}{}"
+            # list(map(int/float, iterable)) → []int / []float64
+            if args.startswith("__map__"):
+                rest = args[len("__map__"):]
+                conv, iterable = rest.split("__", 1)
+                self.add_import("strconv")
+                ind = self.indent()
+                i1 = ind + "\t"
+                if conv == "int":
+                    go_type = "int"
+                    conv_line = f"{i1}\t_result[_k], _ = strconv.Atoi(_v)\n"
+                elif conv == "float":
+                    go_type = "float64"
+                    conv_line = f"{i1}\t_result[_k], _ = strconv.ParseFloat(_v, 64)\n"
+                else:
+                    go_type = "string"
+                    conv_line = f"{i1}\t_result[_k] = _v\n"
+                self.int_slice_vars.add(self._last_lhs) if conv == "int" and hasattr(self, "_last_lhs") else None
+                return (f"func() []{go_type} {{\n"
+                        f"{i1}_raw := {iterable}\n"
+                        f"{i1}_result := make([]{go_type}, len(_raw))\n"
+                        f"{i1}for _k, _v := range _raw {{\n"
+                        f"{conv_line}"
+                        f"{i1}}}\n"
+                        f"{i1}return _result\n"
+                        f"{ind}}}()")
             # list("string") → strings.Split("string", "")
-            # list(iterable) → conversión genérica mediante append en loop
             arg_is_str = (args.startswith('"') or args.startswith("'") or
                           args.startswith('`') or args in self.string_vars or
-                          # también cuando viene de input() / strings.TrimSpace(...)
                           "strings." in args or "reader." in args or
                           args.startswith("func()"))
             if arg_is_str:
                 self.add_import("strings")
-                return f"strings.Split({args}, \"\")"
-            # Para listas o iterables genéricos simplemente devolver el argumento
-            # (en Go un []interface{} ya es iterable tal cual)
+                return f'strings.Split({args}, "")'
             return args
+
+        # ── max / min ──────────────────────────────────────────────────────
+        if func == "max":
+            arg_list = [a.strip() for a in args.split(",")]
+            if len(arg_list) == 2:
+                a0, a1 = arg_list
+                return (f"func() int {{ if {a0} > {a1} {{ return {a0} }}; return {a1} }}()")
+            return f"func() int {{ _mx := {args}[0]; for _, _v := range {args} {{ if _v.(int) > _mx {{ _mx = _v.(int) }} }}; return _mx }}()"
+        if func == "min":
+            arg_list = [a.strip() for a in args.split(",")]
+            if len(arg_list) == 2:
+                a0, a1 = arg_list
+                return (f"func() int {{ if {a0} < {a1} {{ return {a0} }}; return {a1} }}()")
+            return f"func() int {{ _mn := {args}[0]; for _, _v := range {args} {{ if _v.(int) < _mn {{ _mn = _v.(int) }} }}; return _mn }}()"
 
         # ── len ────────────────────────────────────────────────────────────
         if func == "len":
@@ -1565,6 +1648,19 @@ class PythonToGoVisitor(Python3ParserVisitor):
         if func == "str":
             self.add_import("fmt")
             return f'fmt.Sprintf("%v", {args})'
+
+        # ── map ────────────────────────────────────────────────────────────
+        if func == "map":
+            # map(int, iterable) → expandir a conversiones individuales inline
+            # Se resuelve en visitExpr_stmt cuando el lhs es un tuple (n, t = map(...))
+            # Aquí devolvemos un marcador especial que visitExpr_stmt intercepta.
+            # Para otros usos, devolver el iterable tal cual (best-effort).
+            parts = [a.strip() for a in args.split(",", 1)]
+            if len(parts) == 2:
+                conv, iterable = parts[0], parts[1]
+                # Guardamos para que visitExpr_stmt pueda expandirlo
+                return f"__map__{conv}__{iterable}"
+            return args
 
         # Si la función empieza con mayúscula → posible constructor de clase
         if func and func[0].isupper() and "." not in func:
