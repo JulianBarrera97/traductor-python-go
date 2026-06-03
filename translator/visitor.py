@@ -1365,6 +1365,23 @@ class PythonToGoVisitor(Python3ParserVisitor):
             if right_is_str:
                 self.add_import("strings")
                 return f"strings.Repeat({right}, {left})"
+            # List multiplication: [0] * n → make([]int, n)
+            for lst, size in ((left, right), (right, left)):
+                if lst.startswith("[]interface{}{"):
+                    inner = lst[len("[]interface{}{"):-1].strip()
+                    if not inner:
+                        elem_type = "interface{}"
+                    elif inner.lstrip('-').isdigit():
+                        elem_type = "int"
+                    elif '.' in inner and inner.replace('.', '').replace('-', '').isdigit():
+                        elem_type = "float64"
+                    elif inner.startswith('"') or inner.startswith('`'):
+                        elem_type = "string"
+                    elif inner in ("true", "false"):
+                        elem_type = "bool"
+                    else:
+                        elem_type = "interface{}"
+                    return f"make([]{elem_type}, {size})"
             return f"{left} {op} {right}"
 
         return f"{left} {op} {right}"
@@ -1619,6 +1636,10 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 self.add_import("strings")
                 return f'strings.Split({args}, "")'
             return args
+
+        # ── sum ────────────────────────────────────────────────────────────
+        if func == "sum":
+            return f"func() int {{ _s := 0; for _, _v := range {args} {{ _s += _v }}; return _s }}()"
 
         # ── max / min ──────────────────────────────────────────────────────
         if func == "max":
