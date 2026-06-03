@@ -52,10 +52,26 @@ class PythonToGoVisitor(Python3ParserVisitor):
                     inside_raw = True
                 indented_lines.append(f"\t{line}" if line.strip() else "")
         indented_body = "\n".join(indented_lines)
+
+        # Si se usó input(), inyectar un reader compartido al inicio de main()
+        needs_reader = "bufio" in self.imports
+        reader_init = ""
+        if needs_reader:
+            reader_init = (
+                "\t_scanner := bufio.NewScanner(os.Stdin)\n"
+                "\t_scanner.Buffer(make([]byte, 1024*1024), 1024*1024)\n"
+                "\t_readLine := func() string {\n"
+                "\t\t_scanner.Scan()\n"
+                "\t\treturn _scanner.Text()\n"
+                "\t}\n"
+            )
+
         if top_funcs:
             lines.append(top_funcs)
             lines.append("")
         lines.append("func main() {")
+        if reader_init:
+            lines.append(reader_init)
         lines.append(indented_body)
         lines.append("}")
         return "\n".join(lines)
@@ -749,10 +765,11 @@ class PythonToGoVisitor(Python3ParserVisitor):
             ind = self.indent()
             i1  = ind + "\t"
             else_body = self._visit_block(ctx.block(1))
+            body_with_flag = self._inject_broke_flag(body, flag)
             lines = [
                 f"{ind}{flag} := false",
                 f"{ind}for {cond} {{",
-                body,
+                body_with_flag,
                 f"{ind}}}",
                 f"{ind}if !{flag} {{",
                 else_body,
@@ -811,11 +828,11 @@ class PythonToGoVisitor(Python3ParserVisitor):
             flag = "_broke"
             ind  = self.indent()
             else_body = self._visit_block(ctx.block(1))
-            # Reinsertar con flag pattern
+            body_with_flag = self._inject_broke_flag(body, flag)
             lines = [
                 f"{ind}{flag} := false",
-                header.replace(" {", f" {{ // for-else"),
-                body,
+                header,
+                body_with_flag,
                 f"{ind}}}",
                 f"{ind}if !{flag} {{",
                 else_body,
@@ -823,28 +840,37 @@ class PythonToGoVisitor(Python3ParserVisitor):
             ]
         return "\n".join(lines)
 
+    def _inject_broke_flag(self, body: str, flag: str) -> str:
+        """Reemplaza líneas que son solo 'break' por '_broke = true\\nbreak' dentro del cuerpo."""
+        lines = body.split("\n")
+        result = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped == "break":
+                indent_part = line[:len(line) - len(stripped)]
+                result.append(f"{indent_part}{flag} = true")
+                result.append(line)
+            else:
+                result.append(line)
+        return "\n".join(result)
+
     def _for_range(self, targets: str, iterable_ctx, block_ctx) -> str:
         """Traduce for i in range(...) al estilo C de Go."""
-        # Extraer argumentos del range del árbol
-        # iterable_ctx es testlist que contiene un test → atom_expr → atom → name=range + trailer(arglist)
         args = self._extract_call_args(iterable_ctx)
 
         if len(args) == 1:
-            # range(stop) → for i := 0; i < stop; i++
             stop = args[0]
             return self._for_c_style(targets, "0", stop, "1", block_ctx)
         elif len(args) == 2:
-            # range(start, stop) → for i := start; i < stop; i++
             start, stop = args[0], args[1]
             return self._for_c_style(targets, start, stop, "1", block_ctx)
         elif len(args) == 3:
-            # range(start, stop, step)
             start, stop, step = args[0], args[1], args[2]
             return self._for_c_style(targets, start, stop, step, block_ctx)
 
         # Fallback
         body = self._visit_block(block_ctx)
-        return f"{self.indent()}for _, {targets} := range {self.visit(iterable_ctx)} {{{body}{self.indent()}}}"
+        return f"{self.indent()}for _, {targets} := range {self.visit(iterable_ctx)} {{\n{body}\n{self.indent()}}}"
 
     def _for_c_style(self, var: str, start: str, stop: str, step: str, block_ctx) -> str:
         """Genera un for estilo C: for i := start; i < stop; i += step"""
@@ -985,11 +1011,24 @@ class PythonToGoVisitor(Python3ParserVisitor):
             rhs = self.visit(rhs_ctx)
 
             # Asignación múltiple / unpacking: a, b = 0, 1  o  (x, y) = point
-            # Limpiar paréntesis externos del lhs si los tiene
+            # Limpiar paréntesis externos del lhs si los tiene (para unpacking)
             if lhs.startswith("(") and lhs.endswith(")"):
                 lhs = lhs[1:-1]
+            # Quitar paréntesis del rhs SOLO si es una tupla literal: (1, 2, 3)
+            # No quitar si es una expresión general como (a > b) && c
             if rhs.startswith("(") and rhs.endswith(")"):
-                rhs = rhs[1:-1]
+                inner = rhs[1:-1]
+                # Verificar si hay coma a nivel raíz (tupla) y no es llamada a función
+                depth = 0
+                has_top_comma = False
+                for ch in inner:
+                    if ch in "([{": depth += 1
+                    elif ch in ")]}": depth -= 1
+                    elif ch == "," and depth == 0:
+                        has_top_comma = True
+                        break
+                if has_top_comma:
+                    rhs = inner
 
             lhs_has_comma = any(
                 lhs_ctx.getChild(i).getText() == ","
@@ -1007,28 +1046,32 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 vars_list_raw = [v.strip().strip("()") for v in lhs_clean.split(",")]
 
                 if lhs_has_star:
-                    # primero, *resto = lista → Go: primero := lista[0]; resto := lista[1:]
-                    star_idx = next(
-                        (i for i, v in enumerate(vars_list_raw) if v.startswith("*")), None
-                    )
-                    rhs_var = rhs  # la lista fuente
-                    lines_out = []
+                    # primero, *resto = lista → Go: _tmp := lista; primero := _tmp[0]; resto := _tmp[1:]
+                    tmp_var = "_unpack"
+                    lines_out = [f"{self.indent()}{tmp_var} := {rhs}"]
                     for k, v in enumerate(vars_list_raw):
                         clean_v = v.lstrip("*")
                         op_k = "=" if clean_v in self.declared_vars else ":="
                         self.declared_vars.add(clean_v)
                         if v.startswith("*"):
-                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {rhs_var}[{k}:]")
+                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {tmp_var}[{k}:]")
                         else:
-                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {rhs_var}[{k}]")
+                            lines_out.append(f"{self.indent()}{clean_v} {op_k} {tmp_var}[{k}]")
                     return "\n".join(lines_out)
 
                 vars_list = vars_list_raw
                 lhs = ", ".join(vars_list)
-                any_new = any(v not in self.declared_vars for v in vars_list)
-                op = ":=" if any_new else "="
-                for v in vars_list:
-                    self.declared_vars.add(v)
+                # Si alguna variable del lhs es una indexación (contiene '[')
+                # o un acceso a atributo (contiene '.'), se debe usar = en lugar de :=
+                # porque Go no permite := en el lado izquierdo de una indexación.
+                any_index = any("[" in v or "." in v for v in vars_list)
+                if any_index:
+                    op = "="
+                else:
+                    any_new = any(v not in self.declared_vars for v in vars_list)
+                    op = ":=" if any_new else "="
+                    for v in vars_list:
+                        self.declared_vars.add(v)
                 # x, y = point  →  x, y := point[0], point[1]
                 rhs_has_comma = "," in rhs
                 rhs_is_literal = rhs.startswith("[]") or rhs.startswith("{")
@@ -1107,21 +1150,22 @@ class PythonToGoVisitor(Python3ParserVisitor):
         parts = [self.visit(ctx.and_test(i)) for i in range(len(ctx.and_test()))]
         if len(parts) == 1:
             return parts[0]
-        return " || ".join(parts)
+        # Envolver cada parte si contiene && para respetar precedencia
+        wrapped = [self._wrap(p) if " && " in p else p for p in parts]
+        return " || ".join(wrapped)
 
     def visitAnd_test(self, ctx: Python3Parser.And_testContext):
         parts = [self.visit(ctx.not_test(i)) for i in range(len(ctx.not_test()))]
         if len(parts) == 1:
             return parts[0]
-        return " && ".join(parts)
+        # Envolver cada parte si contiene || para respetar precedencia
+        wrapped = [self._wrap(p) if " || " in p else p for p in parts]
+        return " && ".join(wrapped)
 
     def visitNot_test(self, ctx: Python3Parser.Not_testContext):
         if ctx.getChildCount() == 2:   # 'not' not_test
             operand = self.visit(ctx.not_test())
-            # Solo añadir paréntesis si el operando es compuesto (tiene espacios)
-            if " " in operand and not operand.startswith("!"):
-                return f"!({operand})"
-            return f"!{operand}"
+            return f"!{self._wrap(operand)}"
         return self.visit(ctx.comparison())
 
     def visitComparison(self, ctx: Python3Parser.ComparisonContext):
@@ -1190,6 +1234,50 @@ class PythonToGoVisitor(Python3ParserVisitor):
             f"{ind}}}()",
         ])
 
+    # ─────────────────────────────────────────────
+    # Utilidad: paréntesis equilibrados
+    # ─────────────────────────────────────────────
+
+    @staticmethod
+    def _is_balanced(s: str) -> bool:
+        """True si todos los paréntesis en s están balanceados."""
+        depth = 0
+        for ch in s:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth < 0:
+                    return False
+        return depth == 0
+
+    @staticmethod
+    def _wrap(s: str) -> str:
+        """Envuelve en paréntesis solo si la expresión es compuesta (contiene espacio a nivel 0)."""
+        # Si ya está envuelto en paréntesis balanceados, no añadir más
+        if s.startswith("(") and s.endswith(")"):
+            # Verificar que el primer '(' cierra al final
+            depth = 0
+            for i, ch in enumerate(s):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                if depth == 0 and i < len(s) - 1:
+                    break  # cierra antes del final → no es wrap completo
+            else:
+                return s  # sí está completamente envuelto
+        # Necesita paréntesis si tiene operadores a nivel 0
+        depth = 0
+        for ch in s:
+            if ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth -= 1
+            elif ch == ' ' and depth == 0:
+                return f"({s})"
+        return s
+
     def visitExpr(self, ctx: Python3Parser.ExprContext):
         if ctx.getChildCount() == 1:
             return self.visit(ctx.getChild(0))
@@ -1210,23 +1298,20 @@ class PythonToGoVisitor(Python3ParserVisitor):
             self.add_import("math")
             return f"int(math.Pow(float64({left}), float64({right})))"
 
-        # Python // → Go división entera (solo válida entre ints, igual en Go con /)
+        # Python // → Go división entera
         if op == "//":
-            return f"({left} / {right})"
+            return f"{left} / {right}"
 
-        # Concatenación de strings con +: válida en Go también
-        # Repetición de strings con *: no existe en Go → comentario
         if op == "+":
             # Concatenación de listas: nums + [5] → append(nums, 5)
             if right.startswith("[]interface{}"):
-                inner = right[len("[]interface{}{"):-1]  # extraer elementos
+                inner = right[len("[]interface{}{"):-1]
                 if inner:
                     return f"append({left}, {inner})"
                 return left
-            return f"({left} {op} {right})"
+            return f"{left} {op} {right}"
 
         if op == "*":
-            # Detectar string * int: literal o variable conocida como string
             left_is_str  = (left.startswith('"') or left.startswith('`')
                             or left in self.string_vars)
             right_is_str = (right.startswith('"') or right.startswith('`')
@@ -1237,9 +1322,9 @@ class PythonToGoVisitor(Python3ParserVisitor):
             if right_is_str:
                 self.add_import("strings")
                 return f"strings.Repeat({right}, {left})"
-            return f"({left} * {right})"
+            return f"{left} {op} {right}"
 
-        return f"({left} {op} {right})"
+        return f"{left} {op} {right}"
 
     def visitAtom_expr(self, ctx: Python3Parser.Atom_exprContext):
         # AWAIT? atom trailer*
@@ -1401,20 +1486,13 @@ class PythonToGoVisitor(Python3ParserVisitor):
         if func == "input":
             self.add_import("bufio")
             self.add_import("os")
-            self.add_import("strings")
             if args:
                 self.add_import("fmt")
                 return (f'func() string {{\n'
                         f'{self.indent()}\tfmt.Print({args})\n'
-                        f'{self.indent()}\treader := bufio.NewReader(os.Stdin)\n'
-                        f'{self.indent()}\ttext, _ := reader.ReadString(\'\\n\')\n'
-                        f'{self.indent()}\treturn strings.TrimRight(text, "\\r\\n")\n'
+                        f'{self.indent()}\treturn _readLine()\n'
                         f'{self.indent()}}}()')
-            return (f'func() string {{\n'
-                    f'{self.indent()}\treader := bufio.NewReader(os.Stdin)\n'
-                    f'{self.indent()}\ttext, _ := reader.ReadString(\'\\n\')\n'
-                    f'{self.indent()}\treturn strings.TrimRight(text, "\\r\\n")\n'
-                    f'{self.indent()}}}()')
+            return '_readLine()'
 
         # ── append de lista: lista.append(x) → append(lista, x)
         if func.endswith(".append"):
@@ -1454,6 +1532,24 @@ class PythonToGoVisitor(Python3ParserVisitor):
                 return f"append([]interface{{}}{{}}, {base}...)"
             # Para el resto: llamada directa con comentario
             return f"{base}.{method}({args}) /* método de lista */"
+
+        # ── list ───────────────────────────────────────────────────────────
+        if func == "list":
+            if not args:
+                return "[]interface{}{}"
+            # list("string") → strings.Split("string", "")
+            # list(iterable) → conversión genérica mediante append en loop
+            arg_is_str = (args.startswith('"') or args.startswith("'") or
+                          args.startswith('`') or args in self.string_vars or
+                          # también cuando viene de input() / strings.TrimSpace(...)
+                          "strings." in args or "reader." in args or
+                          args.startswith("func()"))
+            if arg_is_str:
+                self.add_import("strings")
+                return f"strings.Split({args}, \"\")"
+            # Para listas o iterables genéricos simplemente devolver el argumento
+            # (en Go un []interface{} ya es iterable tal cual)
+            return args
 
         # ── len ────────────────────────────────────────────────────────────
         if func == "len":
@@ -1554,10 +1650,18 @@ class PythonToGoVisitor(Python3ParserVisitor):
         if ctx.name():
             return self.visit(ctx.name())
 
-        # Expresión entre paréntesis
+        # Expresión entre paréntesis — visitar el interior y dejar que
+        # los niveles superiores añadan paréntesis si son necesarios;
+        # solo re-envolver si el interior es una expresión compuesta
         if text.startswith("("):
+            # Puede ser tupla vacía () o expresión entre paréntesis
+            if ctx.getChildCount() == 2:
+                return "()"  # tupla vacía
             inner = ctx.getChild(1)
-            return f"({self.visit(inner)})"
+            inner_str = self.visit(inner)
+            # Si el interior ya viene con paréntesis propios o es simple,
+            # devolver con un solo nivel de paréntesis
+            return f"({inner_str})"
 
         # Lista []
         if text.startswith("["):

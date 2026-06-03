@@ -22,6 +22,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         with open(sys.argv[1], "r", encoding="utf-8") as f:
             source = f.read()
+        if not source.endswith("\n"):
+            source += "\n"  # ANTLR requiere newline al final
     else:
         source = """# Bug 1: in con strings
 nombre = "Julian"
@@ -77,4 +79,13 @@ match val:
 """
 
     go_code = translate(source)
-    print(go_code)
+    # Normalizar a LF para evitar errores de sintaxis en Go con CRLF
+    go_code = go_code.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Si se pasa -o archivo.go, escribir con UTF-8 + LF (sin BOM)
+    if len(sys.argv) >= 4 and sys.argv[2] == "-o":
+        with open(sys.argv[3], "w", encoding="utf-8", newline="\n") as f:
+            f.write(go_code)
+        print(f"Archivo escrito: {sys.argv[3]}")
+    else:
+        print(go_code)
